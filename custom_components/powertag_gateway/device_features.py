@@ -27,11 +27,16 @@ class UnknownDevice(IntegrationError):
     pass
 
 
-def from_commercial_reference(commercial_reference: str) -> FeatureClass:
+def from_commercial_reference(commercial_reference: str | None) -> FeatureClass:
+    if not commercial_reference:
+        raise UnknownDevice("Missing commercial reference")
+
+    commercial_reference = commercial_reference.strip()
     for regex, result in {
         '^A9MEM1520|A9MEM1521|A9MEM1522|A9MEM1541|A9MEM1542|PLTQO.|PLTE60.$': FeatureClass.A1,
         '^A9MEM1540|A9MEM1543$': FeatureClass.A2,
         '^A9MEM1561|A9MEM1562|A9MEM1563|A9MEM1571|A9MEM1572$': FeatureClass.P1,
+        '^A9 P63 1P\\+N (T|B)$|^A9 P63 3P\\+N (T|B)$|^PowerTag P63 1P\\+N (Top|Bottom)$|^PowerTag P63 3P\\+N (Top|Bottom)$': FeatureClass.P1,
         '^A9MEM1560|A9MEM1570$': FeatureClass.F1,
         '^A9MEM1573$': FeatureClass.F2,
         '^A9MEM1564|A9MEM1574$': FeatureClass.F3,

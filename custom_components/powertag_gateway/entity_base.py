@@ -23,6 +23,7 @@ from .schneider_modbus import (
     LineVoltage,
     PhaseSequence,
     TypeOfGateway,
+    DeviceUsage,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ async def gateway_device_info(
     firmware_version = await client.firmware_version()
     manufacturer = await client.manufacturer()
     product_code = await client.product_code()
+    serial = serial or f"{client.host}:{client.port}"
+    name = name or "PowerTag Gateway"
 
     return DeviceInfo(
         configuration_url=presentation_url,
@@ -58,6 +61,8 @@ async def tag_device_info(
 ) -> DeviceInfo:
     is_unreachable = await client.tag_radio_lqi_gateway(modbus_index) is None
     serial_number = await client.tag_serial_number(modbus_index)
+    if serial_number is None:
+        serial_number = f"{gateway_identification[1]}-{modbus_index}"
 
     kwargs = {
         "configuration_url": presentation_url,
@@ -68,11 +73,11 @@ async def tag_device_info(
         "sw_version": await client.tag_firmware_revision(modbus_index),
         "manufacturer": await client.tag_vendor_name(modbus_index),
         "model": await client.tag_product_model(modbus_index),
-        "name": await client.tag_name(modbus_index),
+        "name": await client.tag_name(modbus_index) or f"PowerTag {modbus_index}",
     }
     if not is_unreachable:
         usage = await client.tag_usage(modbus_index)
-        if usage is not None:
+        if usage is not None and usage not in [DeviceUsage.UNDEFINED, DeviceUsage.INVALID]:
             kwargs["suggested_area"] = usage.name
 
     if not is_unreachable and logging.DEBUG >= _LOGGER.level:
@@ -109,14 +114,14 @@ def phase_sequence_to_phases(phase_sequence: PhaseSequence) -> list[Phase]:
         PhaseSequence.CAB: [Phase.C, Phase.A, Phase.B],
         PhaseSequence.CBA: [Phase.C, Phase.B, Phase.A],
         PhaseSequence.INVALID: [],
-    }[phase_sequence]
+    }.get(phase_sequence, [])
 
 
 def phase_sequence_to_line_voltages(
     phase_sequence: PhaseSequence, feature_class: FeatureClass
 ) -> list[LineVoltage]:
     has_neutral = feature_class not in [FeatureClass.A2, FeatureClass.F2]
-    if phase_sequence is PhaseSequence.INVALID:
+    if phase_sequence is PhaseSequence.INVALID or phase_sequence is None:
         return []
     elif phase_sequence in [PhaseSequence.A, PhaseSequence.B, PhaseSequence.C]:
         if not has_neutral:
@@ -183,7 +188,7 @@ class WirelessDeviceEntity(Entity):
         raise NotImplementedError()
 
     @staticmethod
-    def supports_firmware_version(firmware_version: str) -> bool:
+    def supports_firmware_version(firmware_version: str | None) -> bool:
         return True
 
     def _handle_availability(self, value: object):
@@ -236,7 +241,9 @@ def collect_entities(
             assert param[0] == "serial_number"
             args.append(tag_device["serial_number"])
         else:
-            raise AssertionError("Dev fucked up, please create a GitHub issue. :(")
+            raise AssertionError(
+                f"Unsupported entity constructor parameter: {param[0]} ({typey})"
+            )
     if enumerate_param:
         arg_index, enumerated_param = enumerate_param
         for phase in enumerated_param:
@@ -274,7 +281,14 @@ async def async_setup_entities(
 
     _LOGGER.debug("Starting to scan for devices...")
     for i in range(1, 100):
-        modbus_address = await client.modbus_address_of_node(i)
+        try:
+            modbus_address = await client.modbus_address_of_node(i)
+        except Exception:
+            _LOGGER.exception("Could not read configured wireless device #%s", i)
+            if client.type_of_gateway == TypeOfGateway.PANEL_SERVER:
+                continue
+            break
+
         _LOGGER.debug(f"Found device #{i} at address {modbus_address}")
 
         if modbus_address is None:
@@ -284,79 +298,89 @@ async def async_setup_entities(
             else:
                 break
 
-        if client.type_of_gateway == TypeOfGateway.SMARTLINK:
-            identifier = await client.tag_product_identifier(modbus_address)
-            if identifier is None:
-                break
+        try:
+            if client.type_of_gateway == TypeOfGateway.SMARTLINK:
+                identifier = await client.tag_product_identifier(modbus_address)
+                if identifier is None:
+                    break
 
-            _LOGGER.debug(
-                f"Found device #{modbus_address} to have product wireless device type code {identifier}"
-            )
-
-            try:
-                feature_class = from_wireless_device_type_code(identifier)
-            except UnknownDevice:
-                _LOGGER.error(
-                    f"I don't know what this product identifier is: {identifier}, but we can fix this! :) "
-                    f"Please create a GitHub issue and tell me model of the {modbus_address}th wireless "
-                    f"device."
+                _LOGGER.debug(
+                    f"Found device #{modbus_address} to have product wireless device type code {identifier}"
                 )
-                continue
 
-        else:
-            commercial_reference = await client.tag_product_code(modbus_address)
+                try:
+                    feature_class = from_wireless_device_type_code(identifier)
+                except UnknownDevice:
+                    _LOGGER.error(
+                        f"I don't know what this product identifier is: {identifier}, but we can fix this. "
+                        f"Please create a GitHub issue and tell me model of the {modbus_address}th wireless "
+                        f"device."
+                    )
+                    continue
 
-            _LOGGER.debug(f"Device #{modbus_address} is {commercial_reference}")
+            else:
+                commercial_reference = await client.tag_product_code(modbus_address)
+                if not commercial_reference:
+                    commercial_reference = await client.tag_product_model(modbus_address)
 
-            try:
-                feature_class = from_commercial_reference(commercial_reference)
-            except UnknownDevice:
-                _LOGGER.error(
-                    f"Unsupported wireless device: {commercial_reference}, "
-                    f"to request support, please create a GitHub issue for this device."
-                )
-                continue
+                _LOGGER.debug(f"Device #{modbus_address} is {commercial_reference}")
 
-        if client.type_of_gateway is not TypeOfGateway.SMARTLINK:
-            is_disabled = await client.tag_radio_lqi_gateway(modbus_address) is None
-            if is_disabled:
-                _LOGGER.warning(
-                    f"The device {await client.tag_name(modbus_address)} is not reachable; will ignore this one."
-                )
-                continue
+                try:
+                    feature_class = from_commercial_reference(commercial_reference)
+                except UnknownDevice:
+                    _LOGGER.error(
+                        f"Unsupported wireless device: {commercial_reference}, "
+                        f"to request support, please create a GitHub issue for this device."
+                    )
+                    continue
 
-        tag_device = await tag_device_info(
-            client,
-            modbus_address,
-            presentation_url,
-            next(iter(gateway_device["identifiers"])),
-        )
-        device_name = tag_device["name"]
+            if client.type_of_gateway is not TypeOfGateway.SMARTLINK:
+                is_disabled = await client.tag_radio_lqi_gateway(modbus_address) is None
+                if is_disabled:
+                    _LOGGER.warning(
+                        f"The device {await client.tag_name(modbus_address)} is not reachable; will ignore this one."
+                    )
+                    continue
 
-        tag_phase_sequence = await client.tag_phase_sequence(modbus_address)
-        if not tag_phase_sequence:
-            _LOGGER.warning(
-                f"The phase sequence of {device_name} was not defined."
-                f"Skipping adding phase-specific entities..."
-            )
-
-        for powertag_entity in [
-            entity
-            for entity in powertag_entities
-            if entity.supports_feature_set(feature_class)
-            and entity.supports_gateway(client.type_of_gateway)
-            and entity.supports_firmware_version(tag_device["sw_version"])
-        ]:
-            collect_entities(
+            tag_device = await tag_device_info(
                 client,
-                entities,
-                feature_class,
                 modbus_address,
-                powertag_entity,
-                tag_device,
-                tag_phase_sequence,
-                device_unique_id_version,
+                presentation_url,
+                next(iter(gateway_device["identifiers"])),
             )
+            device_name = tag_device["name"]
 
-        _LOGGER.info(f"Done with device at address {modbus_address}: {device_name}")
+            tag_phase_sequence = await client.tag_phase_sequence(modbus_address)
+            if tag_phase_sequence is PhaseSequence.INVALID:
+                _LOGGER.warning(
+                    f"The phase sequence of {device_name} was not defined. "
+                    f"Skipping adding phase-specific entities..."
+                )
+
+            for powertag_entity in [
+                entity
+                for entity in powertag_entities
+                if entity.supports_feature_set(feature_class)
+                and entity.supports_gateway(client.type_of_gateway)
+                and entity.supports_firmware_version(tag_device.get("sw_version"))
+            ]:
+                collect_entities(
+                    client,
+                    entities,
+                    feature_class,
+                    modbus_address,
+                    powertag_entity,
+                    tag_device,
+                    tag_phase_sequence,
+                    device_unique_id_version,
+                )
+
+            _LOGGER.info(f"Done with device at address {modbus_address}: {device_name}")
+        except Exception:
+            _LOGGER.exception(
+                "Failed to set up wireless device #%s at address %s",
+                i,
+                modbus_address,
+            )
+            continue
     return entities

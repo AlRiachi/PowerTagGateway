@@ -8,7 +8,7 @@ from pymodbus.client import ModbusTcpClient, AsyncModbusTcpClient  # type: ignor
 from pymodbus.constants import DeviceInformation  # type: ignore
 from pymodbus.pdu import ExceptionResponse  # type: ignore
 from pymodbus.client.mixin import ModbusClientMixin  # type: ignore
-from pymodbus.exceptions import ModbusIOException  # type: ignore
+from pymodbus.exceptions import ConnectionException, ModbusIOException  # type: ignore
 
 GATEWAY_SLAVE_ID = 255
 SYNTHESIS_TABLE_SLAVE_ID_START = 247
@@ -190,9 +190,22 @@ class TypeOfGateway(enum.Enum):
     SMARTLINK = "Smartlink SI D"
 
 
+def _enum_or_none(enum_type: type[enum.Enum], value: int | None):
+    if value is None:
+        return None
+
+    try:
+        return enum_type(value)
+    except ValueError:
+        _LOGGER.debug("Unknown %s value: %s", enum_type.__name__, value)
+        return None
+
+
 class SchneiderModbus:
     def __init__(self, host, type_of_gateway: TypeOfGateway, port=502, timeout=5):
         _LOGGER.info(f"Connecting Modbus TCP to {host}:{port}")
+        self.host = host
+        self.port = port
         self.client = AsyncModbusTcpClient(host=host, port=port, timeout=timeout)
         self.type_of_gateway = type_of_gateway
         self.synthetic_slave_id = None
@@ -200,6 +213,12 @@ class SchneiderModbus:
     @classmethod
     async def create(cls, host, type_of_gateway: TypeOfGateway, port=502, timeout=5):
         instance = cls(host, type_of_gateway, port, timeout)
+        try:
+            await instance.client.connect()
+        except OSError as err:
+            raise ConnectionException(f"Could not connect to {host}:{port}") from err
+        if not instance.client.connected:
+            raise ConnectionException(f"Could not connect to {host}:{port}")
         if type_of_gateway is TypeOfGateway.POWERTAG_LINK:
             instance.synthetic_slave_id = await instance.find_synthetic_table_slave_id()
         return instance
@@ -264,7 +283,7 @@ class SchneiderModbus:
         """PowerTag Link gateway status and diagnostic register"""
         assert self.type_of_gateway == TypeOfGateway.PANEL_SERVER
         code = await self.__read_int_16(0x009E, GATEWAY_SLAVE_ID)
-        return PanelHealth(code) if code is not None else None
+        return _enum_or_none(PanelHealth, code)
 
     # Date and Time
 
@@ -331,7 +350,7 @@ class SchneiderModbus:
     ) -> PowerFactorSignConvention | None:
         """Power factor sign convention"""
         power_factor_sign = await self.__read_int_16(0xC0D, tag_index)
-        return PowerFactorSignConvention(power_factor_sign) if power_factor_sign is not None else None
+        return _enum_or_none(PowerFactorSignConvention, power_factor_sign)
 
     # Frequency Metering Data
 
@@ -598,23 +617,25 @@ class SchneiderModbus:
     async def tag_usage(self, tag_index: int) -> DeviceUsage | None:
         """Indicates the usage of the wireless device."""
         usage = await self.__read_int_16(0x7925, tag_index)
-        return DeviceUsage(usage) if usage is not None else None
+        return _enum_or_none(DeviceUsage, usage)
 
     async def tag_phase_sequence(self, tag_index: int) -> PhaseSequence | None:
         """Phase sequence."""
         sequence = await self.__read_int_16(0x7926, tag_index)
         _LOGGER.debug(f"Raw phase sequence register 0x7926 for slave {tag_index}: {sequence}")
-        return PhaseSequence(sequence) if sequence is not None else PhaseSequence.INVALID
+        if sequence is None:
+            return PhaseSequence.INVALID
+        return _enum_or_none(PhaseSequence, sequence) or PhaseSequence.INVALID
 
     async def tag_position(self, tag_index: int) -> Position | None:
         """Mounting position"""
         position = await self.__read_int_16(0x7927, tag_index)
-        return Position(position) if position is not None else None
+        return _enum_or_none(Position, position)
 
     async def tag_circuit_diagnostic(self, tag_index: int) -> Position | None:
         """Circuit diagnostics"""
         position = await self.__read_int_16(0x7928, tag_index)
-        return Position(position) if position is not None else None
+        return _enum_or_none(Position, position)
 
     async def tag_rated_current(self, tag_index: int) -> int | None:
         """Rated current of the protective device to the wireless device"""
@@ -644,7 +665,7 @@ class SchneiderModbus:
         if self.type_of_gateway == TypeOfGateway.SMARTLINK:
             return Position.INVALID
         position = await self.__read_int_16(0x792F, tag_index)
-        return Position(position) if position is not None else None
+        return _enum_or_none(Position, position)
 
     # Device identification
 
@@ -671,7 +692,7 @@ class SchneiderModbus:
         """Wireless device code type"""
         if self.type_of_gateway == TypeOfGateway.SMARTLINK:
             try:
-                identifier = self.__read_int_16(0x7930, tag_index)
+                identifier = await self.__read_int_16(0x7930, tag_index)
                 if not identifier:
                     _LOGGER.error(
                         "The powertag returned an error while requesting its product type"
@@ -691,7 +712,7 @@ class SchneiderModbus:
                 )
                 return None
         else:
-            identifier = self.__read_int_16(0x7937, tag_index)
+            identifier = await self.__read_int_16(0x7937, tag_index)
             product_type = [p for p in ProductType if p.value[1] == identifier]
             if not product_type:
                 _LOGGER.warning(f"Unknown product type: {identifier}")
@@ -745,13 +766,15 @@ class SchneiderModbus:
 
     # Diagnostic Data Registers
 
-    async def tag_radio_communication_valid(self, tag_index: int) -> bool:
+    async def tag_radio_communication_valid(self, tag_index: int) -> bool | None:
         """Validity of the RF communication between PowerTag system and PowerTag Link gateway status."""
-        return await self.__read_int_16(0x79A8, tag_index) != 0
+        value = await self.__read_int_16(0x79A8, tag_index)
+        return None if value is None else value != 0
 
-    async def tag_wireless_communication_valid(self, tag_index: int) -> bool:
+    async def tag_wireless_communication_valid(self, tag_index: int) -> bool | None:
         """Communication status between PowerTag Link gateway and wireless devices."""
-        return await self.__read_int_16(0x79A9, tag_index) != 0
+        value = await self.__read_int_16(0x79A9, tag_index)
+        return None if value is None else value != 0
 
     async def tag_radio_per_tag(self, tag_index: int) -> float | None:
         """Packet Error Rate (PER) of the device, received by PowerTag Link gateway"""
@@ -937,6 +960,9 @@ class SchneiderModbus:
                 ),
                 timeout=5.0,
             )
+            if result is None:
+                _LOGGER.debug(f"No Modbus response reading {address} from slave ID {slave_id}")
+                return None
             if result.isError():
                 _LOGGER.debug(f"Modbus error reading {address} from slave ID {slave_id}")
                 return None
@@ -945,7 +971,7 @@ class SchneiderModbus:
         except asyncio.TimeoutError:
             _LOGGER.debug(f"Timeout when fetching address {address} from slave ID {slave_id}")
             return None
-        except ModbusIOException as e:
+        except (ConnectionException, ModbusIOException, OSError) as e:
             _LOGGER.error(f"Error when fetching {address} from slave ID {slave_id}: {e}")
             return None
 
@@ -960,6 +986,9 @@ class SchneiderModbus:
                 self.client.write_registers(address, registers, device_id=slave_id),
                 timeout=5.0,
             )
+            if result is None:
+                _LOGGER.debug(f"No Modbus response writing {address} to slave ID {slave_id}")
+                return None
             if result.isError():
                 _LOGGER.debug(f"Modbus error writing {address} to slave ID {slave_id}")
                 return None
@@ -967,6 +996,9 @@ class SchneiderModbus:
             _LOGGER.debug(
                 f"Timeout when writing to address {address} to slave ID {slave_id}"
             )
+            return None
+        except (ConnectionException, ModbusIOException, OSError) as e:
+            _LOGGER.error(f"Error when writing {address} to slave ID {slave_id}: {e}")
             return None
 
     async def __identify(self, _: int):
@@ -983,7 +1015,15 @@ class SchneiderModbus:
 
     async def __read_string(self, address: int, count: int, slave_id: int) -> str | None:
         registers = await self.__async_read(address, count, slave_id)
-        return self.client.convert_from_registers(registers, ModbusClientMixin.DATATYPE.STRING)
+        if registers is None:
+            return None
+
+        value = self.client.convert_from_registers(
+            registers, ModbusClientMixin.DATATYPE.STRING
+        )
+        if isinstance(value, bytes):
+            value = value.decode(errors="ignore")
+        return value.rstrip("\x00").strip()
 
     async def __write_string(self, address: int, slave_id: int, string: str):
         registers = self.client.convert_to_registers(
@@ -1079,7 +1119,14 @@ class SchneiderModbus:
         ):
             return None
 
-        return datetime(year, month, day, hour, minute, second, millisecond)
+        try:
+            return datetime(year, month, day, hour, minute, second, millisecond)
+        except ValueError:
+            _LOGGER.debug(
+                f"Invalid datetime read from address {address} on slave ID {slave_id}: "
+                f"{year=}, {month=}, {day=}, {hour=}, {minute=}, {second=}, {millisecond=}"
+            )
+            return None
 
 # client = SchneiderModbus("192.168.1.114", TypeOfGateway.PANEL_SERVER)
 # print(client.modbus_address_of_node(99))

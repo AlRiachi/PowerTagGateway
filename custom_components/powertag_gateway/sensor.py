@@ -98,7 +98,7 @@ async def async_setup_entry(
     presentation_url = data[CONF_INTERNAL_URL]
     client = data[CONF_CLIENT]
     gateway_device = await gateway_device_info(client, presentation_url)
-    gateway_serial = await client.serial_number()
+    gateway_serial = gateway_device["serial_number"]
 
     entities.extend(
         [
@@ -1797,11 +1797,14 @@ class PowerTagTemperature(WirelessDeviceEntity, SensorEntity):
         ]
 
     @staticmethod
-    def supports_firmware_version(firmware_version: str) -> bool:
+    def supports_firmware_version(firmware_version: str | None) -> bool:
         import re
 
+        if not firmware_version:
+            return False
+
         major_version = re.sub(r"[^0-9.]", "", firmware_version).split(".")[0]
-        return int(major_version) >= 4
+        return bool(major_version) and int(major_version) >= 4
 
 
 class PowerTagActivePower(WirelessDeviceEntity, SensorEntity):

@@ -36,7 +36,7 @@ async def async_setup_entry(
     presentation_url = data[CONF_INTERNAL_URL]
     client = data[CONF_CLIENT]
     gateway_device = await gateway_device_info(client, presentation_url)
-    gateway_serial = await client.serial_number()
+    gateway_serial = gateway_device["serial_number"]
 
     entities.extend([gateway_entity for gateway_entity
                      in [GatewayStatus(client, gateway_device, gateway_serial), GatewayHealth(client, gateway_device, gateway_serial)]
