@@ -1,5 +1,6 @@
 import asyncio
 import enum
+import inspect
 import logging
 import math
 from datetime import datetime
@@ -209,6 +210,7 @@ class SchneiderModbus:
         self.client = AsyncModbusTcpClient(host=host, port=port, timeout=timeout)
         self.type_of_gateway = type_of_gateway
         self.synthetic_slave_id = None
+        self._slave_id_keyword: str | None = None
 
     @classmethod
     async def create(cls, host, type_of_gateway: TypeOfGateway, port=502, timeout=5):
@@ -944,8 +946,54 @@ class SchneiderModbus:
         # Round the number to the calculated number of fractional digits
         return round(number, fractional_digits)
 
-    def __write(self, address: int, registers: list[int], slave_id: int):
-        self.client.write_registers(address, registers, device_id=slave_id)
+    def __slave_id_kwargs(self, method_name: str, slave_id: int) -> dict[str, int]:
+        if self._slave_id_keyword is None:
+            method = getattr(self.client, method_name)
+            try:
+                parameters = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+
+            for keyword in ("device_id", "slave", "unit"):
+                if keyword in parameters:
+                    self._slave_id_keyword = keyword
+                    break
+            else:
+                accepts_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                self._slave_id_keyword = "unit" if accepts_kwargs else "slave"
+
+        return {self._slave_id_keyword: slave_id}
+
+    async def __call_with_slave_id(
+        self, method_name: str, *args, slave_id: int, **kwargs
+    ):
+        method = getattr(self.client, method_name)
+        last_error: TypeError | None = None
+
+        keywords = dict.fromkeys(
+            [
+                *self.__slave_id_kwargs(method_name, slave_id).keys(),
+                "slave",
+                "device_id",
+                "unit",
+            ]
+        )
+        for keyword in keywords:
+            try:
+                result = method(*args, **kwargs, **{keyword: slave_id})
+                self._slave_id_keyword = keyword
+                return await result
+            except TypeError as err:
+                if "unexpected keyword argument" not in str(err):
+                    raise
+                last_error = err
+
+        if last_error is not None:
+            raise last_error
+        raise TypeError(f"Could not call {method_name} with a slave ID")
 
     async def __async_read(
         self, address: int, count: int, slave_id: int
@@ -955,8 +1003,11 @@ class SchneiderModbus:
                 await self.client.connect()
 
             result = await asyncio.wait_for(
-                self.client.read_holding_registers(
-                    address=address, count=count, device_id=slave_id
+                self.__call_with_slave_id(
+                    "read_holding_registers",
+                    address=address,
+                    count=count,
+                    slave_id=slave_id,
                 ),
                 timeout=5.0,
             )
@@ -983,7 +1034,12 @@ class SchneiderModbus:
                 await self.client.connect()
 
             result = await asyncio.wait_for(
-                self.client.write_registers(address, registers, device_id=slave_id),
+                self.__call_with_slave_id(
+                    "write_registers",
+                    address,
+                    registers,
+                    slave_id=slave_id,
+                ),
                 timeout=5.0,
             )
             if result is None:
